@@ -1,0 +1,32 @@
+# ──────────────────────────────────────────────────────────────────
+# .gitignore — AUTO VOXIS
+# ──────────────────────────────────────────────────────────────────
+
+# Pastas de trabalho — criadas automaticamente pelo bot ao iniciar
+voxis/
+
+# Arquivo de configuração com credenciais e dados do sistema
+voxis_config.json
+
+# Build do PyInstaller (caso empacote o bot futuramente)
+autovoxis.spec
+build/
+dist/
+
+# Cache Python
+__pycache__/
+*.py[cod]
+
+# Ambiente virtual
+venv/
+.venv/
+
+# OS / IDEs
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Logs gerados
+*.log
+*.json
