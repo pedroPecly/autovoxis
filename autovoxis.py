@@ -245,6 +245,10 @@ def _criar_driver() -> webdriver.Chrome:
     opts.add_argument("--disable-notifications")
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
+    opts.add_experimental_option("prefs", {
+        "credentials_enable_service": False,
+        "profile.password_manager_enabled": False,
+    })
     return webdriver.Chrome(
         service=Service(ChromeDriverManager().install()),
         options=opts,
@@ -296,70 +300,265 @@ def _fazer_login(driver: webdriver.Chrome, wait: WebDriverWait):
     driver.find_element(By.ID, "btn_enviar").click()
     log("🔑 Login enviado — aguardando autenticação...")
 
-    # Aguarda o menu aparecer como confirmação de login OK
-    wait.until(EC.presence_of_element_located((By.ID, CONF["menu_administracao_id"])))
+    # Aguarda o menu aparecer como confirmação de login OK.
+    # O SAUDI usa frameset, então o menu pode estar em um frame filho —
+    # fazemos polling manual percorrendo todos os frames.
+    menu_id  = CONF["menu_administracao_id"]
+    deadline = time.time() + int(CONF.get("timeout_aguarde", 40))
+    encontrado = False
+    while time.time() < deadline and not encontrado:
+        driver.switch_to.default_content()
+        try:
+            driver.find_element(By.ID, menu_id)
+            encontrado = True
+            break
+        except NoSuchElementException:
+            pass
+        for tag in ("frame", "iframe"):
+            for fr in driver.find_elements(By.TAG_NAME, tag):
+                try:
+                    driver.switch_to.frame(fr)
+                    driver.find_element(By.ID, menu_id)
+                    encontrado = True
+                    break
+                except (NoSuchElementException, WebDriverException):
+                    driver.switch_to.default_content()
+            if encontrado:
+                break
+        if not encontrado:
+            time.sleep(0.8)
+    if not encontrado:
+        raise TimeoutException(
+            f"Menu '{menu_id}' não encontrado após login — "
+            "verifique credenciais ou ID do menu na config.")
     log("✅ Login realizado com sucesso!")
+
+
+def _clicar_texto_em_qualquer_frame(driver: webdriver.Chrome,
+                                    texto: str, timeout: int = 15):
+    """
+    Procura em todos os frames (até 2 níveis) um elemento com o texto exato
+    e clica nele. Usa índices para evitar StaleElementReferenceException.
+    Retorna o nome do frame onde achou.
+    """
+    xp = f"//*[normalize-space(text())='{texto}']"
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        driver.switch_to.default_content()
+        # contexto raiz
+        try:
+            el = driver.find_element(By.XPATH, xp)
+            try: el.click()
+            except Exception: driver.execute_script("arguments[0].click();", el)
+            return "(raiz)"
+        except NoSuchElementException:
+            pass
+        # nível 1
+        for tag in ("frame", "iframe"):
+            n1 = len(driver.find_elements(By.TAG_NAME, tag))
+            for i in range(n1):
+                try:
+                    driver.switch_to.default_content()
+                    frs1 = driver.find_elements(By.TAG_NAME, tag)
+                    if i >= len(frs1):
+                        break
+                    fn1 = (frs1[i].get_attribute("name")
+                           or frs1[i].get_attribute("id") or f"#{i}")
+                    driver.switch_to.frame(i)
+                    try:
+                        el = driver.find_element(By.XPATH, xp)
+                        tag = el.tag_name   # lê ANTES do clique
+                        try: el.click()
+                        except Exception:
+                            driver.execute_script("arguments[0].click();", el)
+                        return fn1
+                    except NoSuchElementException:
+                        pass
+                    # nível 2
+                    for tag2 in ("frame", "iframe"):
+                        n2 = len(driver.find_elements(By.TAG_NAME, tag2))
+                        for j in range(n2):
+                            try:
+                                driver.switch_to.default_content()
+                                driver.switch_to.frame(i)
+                                frs2 = driver.find_elements(By.TAG_NAME, tag2)
+                                if j >= len(frs2):
+                                    break
+                                fn2 = (frs2[j].get_attribute("name")
+                                       or frs2[j].get_attribute("id") or f"#{j}")
+                                driver.switch_to.frame(j)
+                                el = driver.find_element(By.XPATH, xp)
+                                _ = el.tag_name   # valida antes do clique
+                                try: el.click()
+                                except Exception:
+                                    driver.execute_script("arguments[0].click();", el)
+                                return f"{fn1}>{fn2}"
+                            except (NoSuchElementException, WebDriverException,
+                                    StaleElementReferenceException):
+                                pass
+                except (WebDriverException, StaleElementReferenceException):
+                    pass
+        time.sleep(0.5)
+    raise TimeoutException(f"Elemento com texto '{texto}' não encontrado")
+
+
+def _encontrar_em_frame_conteudo(driver: webdriver.Chrome, wait: WebDriverWait,
+                                 by, value):
+    """
+    Busca um elemento em frameConteudo e até 2 níveis de iframes aninhados.
+    Deixa o driver posicionado no frame onde encontrou.
+    """
+    timeout = int(CONF.get("timeout_aguarde", 40))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        # Nível 0: frameConteudo direto
+        try:
+            driver.switch_to.default_content()
+            driver.switch_to.frame(
+                driver.find_element(By.NAME, CONF["frame_conteudo"]))
+        except Exception:
+            time.sleep(0.5)
+            continue
+        try:
+            return driver.find_element(by, value)
+        except NoSuchElementException:
+            pass
+
+        # Nível 1: iframes dentro de frameConteudo
+        for tag in ("frame", "iframe"):
+            n1 = len(driver.find_elements(By.TAG_NAME, tag))
+            for i in range(n1):
+                try:
+                    driver.switch_to.default_content()
+                    driver.switch_to.frame(
+                        driver.find_element(By.NAME, CONF["frame_conteudo"]))
+                    if i >= len(driver.find_elements(By.TAG_NAME, tag)):
+                        break
+                    driver.switch_to.frame(i)
+                    try:
+                        return driver.find_element(by, value)
+                    except NoSuchElementException:
+                        pass
+
+                    # Nível 2: iframes dentro do iframe de nível 1
+                    for tag2 in ("frame", "iframe"):
+                        n2 = len(driver.find_elements(By.TAG_NAME, tag2))
+                        for j in range(n2):
+                            try:
+                                driver.switch_to.default_content()
+                                driver.switch_to.frame(
+                                    driver.find_element(By.NAME, CONF["frame_conteudo"]))
+                                if i >= len(driver.find_elements(By.TAG_NAME, tag)):
+                                    break
+                                driver.switch_to.frame(i)
+                                if j >= len(driver.find_elements(By.TAG_NAME, tag2)):
+                                    break
+                                driver.switch_to.frame(j)
+                                return driver.find_element(by, value)
+                            except (NoSuchElementException, WebDriverException,
+                                    StaleElementReferenceException):
+                                pass
+                except (WebDriverException, StaleElementReferenceException):
+                    pass
+        time.sleep(0.5)
+    raise TimeoutException(f"Elemento ({by}='{value}') não encontrado em frameConteudo")
 
 
 def _navegar_para_upload(driver: webdriver.Chrome, wait: WebDriverWait):
     """
-    Menu: Administração → Integração → Upload de Arquivos.
-    O formulário de upload carrega no iframe 'frameConteudo'.
+    Menu: Administração → Integração → (Upload de Arquivos se existir).
+    Em algumas versões do SAUDI, Integração já carrega o Integration Manager
+    diretamente sem o link 'Upload de Arquivos'.
     """
-    _switch_to_menu_frame(driver)
-
-    # 1) Hover em Administração para revelar o submenu
-    adm = wait.until(EC.presence_of_element_located(
-        (By.ID, CONF["menu_administracao_id"])))
-    ActionChains(driver).move_to_element(adm).perform()
+    # 1) Clica em Administração (topFrame, <div>)
+    _clicar_texto_em_qualquer_frame(driver, "Administração")
     log("  → Administração")
 
-    # 2) Clica em Integração (expande submenu via JS)
-    integ = wait.until(EC.element_to_be_clickable(
-        (By.XPATH, "//a[normalize-space(text())='Integração']")))
-    integ.click()
+    # 2) Clica em Integração (frameConteudo, <a>)
+    _clicar_texto_em_qualquer_frame(driver, "Integração")
     log("  → Integração")
 
-    # 3) Clica em Upload de Arquivos (carrega em frameConteudo)
-    upload = wait.until(EC.element_to_be_clickable(
-        (By.XPATH, "//a[normalize-space(text())='Upload de Arquivos']")))
-    upload.click()
-    log("  → Upload de Arquivos")
+    # 3) 'Upload de Arquivos' é opcional — sistema pode ir direto ao manager
+    try:
+        _clicar_texto_em_qualquer_frame(driver, "Upload de Arquivos",
+                                        timeout=5)
+        log("  → Upload de Arquivos")
+    except Exception:
+        log("  → Upload de Arquivos não encontrado — sistema foi direto ao manager")
 
-    # 4) Volta ao contexto principal e entra no iframe de conteúdo
-    driver.switch_to.default_content()
-    wait.until(EC.frame_to_be_available_and_switch_to_it(
-        (By.NAME, CONF["frame_conteudo"])))
-
-    # 5) Aguarda o select de serviço
-    wait.until(EC.presence_of_element_located((By.ID, "filtroServiceId")))
+    # 4) Aguarda o select de serviço (busca em nested frames)
+    _encontrar_em_frame_conteudo(driver, wait, By.ID, "filtroServiceId")
     log("📂 Formulário de upload carregado")
 
 
 def _selecionar_cmat(driver: webdriver.Chrome, wait: WebDriverWait):
     """
-    Seleciona o serviço configurado (padrão: CMAT) no dropdown.
-    O onchange dispara submissão que recarrega o formulário
-    com o campo de arquivo.
+    Seleciona o serviço configurado (padrão: CMAT) via JS direto e aciona
+    o formulário de upload usando submeter() + mostrarDivs(true).
     """
-    sel_el = wait.until(EC.presence_of_element_located((By.ID, "filtroServiceId")))
-    Select(sel_el).select_by_value(CONF["servico"])
-    log(f"  ✅ Serviço {CONF['servico']} selecionado")
+    servico = CONF["servico"]
 
-    # Aguarda o campo de arquivo aparecer após o reload do formulário
-    wait.until(EC.presence_of_element_located(
-        (By.ID, "fileUpload_fileUploadVO_file")))
+    # Garante que o driver está em frameConteudoExterno (nível 1 de aninhamento)
+    _encontrar_em_frame_conteudo(driver, wait, By.ID, "filtroServiceId")
+
+    # Re-entra limpo em frameConteudoExterno por índice para evitar stale refs
+    driver.switch_to.default_content()
+    driver.switch_to.frame(driver.find_element(By.NAME, CONF["frame_conteudo"]))
+    driver.switch_to.frame(0)
+
+    # 1) Define o valor e chama submeter() diretamente — não depende do onchange
+    driver.execute_script("""
+        var sel = document.getElementById('filtroServiceId');
+        if (sel) sel.value = arguments[0];
+        if (typeof submeter === 'function') {
+            submeter('selecionarResumoServico');
+        } else if (sel) {
+            sel.dispatchEvent(new Event('change', {bubbles: true}));
+        }
+    """, servico)
+    log(f"  ✅ Serviço {servico} selecionado (submeter chamado)")
+
+    # 2) Aguarda formulário recarregar com os radio buttons (máx 15s)
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        try:
+            driver.switch_to.default_content()
+            driver.switch_to.frame(
+                driver.find_element(By.NAME, CONF["frame_conteudo"]))
+            driver.switch_to.frame(0)
+            if driver.find_elements(By.NAME, "tipOperacao"):
+                break
+        except Exception:
+            pass
+        time.sleep(0.8)
+
+    # 3) Seleciona 'NOVO ARQUIVO' e chama mostrarDivs(true) para revelar
+    #    o sub-iframe com o campo de arquivo
+    driver.switch_to.default_content()
+    driver.switch_to.frame(driver.find_element(By.NAME, CONF["frame_conteudo"]))
+    driver.switch_to.frame(0)
+    driver.execute_script("""
+        var radios = document.getElementsByName('tipOperacao');
+        if (radios && radios.length > 0) radios[0].checked = true;
+        if (typeof mostrarDivs === 'function') mostrarDivs(true);
+    """)
+    log("  ✅ Operação 'Novo Arquivo' selecionada")
+
+    # 4) Aguarda o campo de arquivo aparecer (está em sub-frame#1 dentro de
+    #    frameConteudoExterno — 3 níveis no total)
+    _encontrar_em_frame_conteudo(driver, wait, By.CSS_SELECTOR, "input[type='file']")
     log("  ✅ Formulário pronto para upload")
 
 
 def _fazer_upload(driver: webdriver.Chrome, wait: WebDriverWait,
                   caminho_arquivo: str):
     """Envia o caminho do arquivo para o input e clica em confirmar."""
-    file_input = driver.find_element(By.ID, "fileUpload_fileUploadVO_file")
+    file_input = _encontrar_em_frame_conteudo(
+        driver, wait, By.ID, "fileUpload_fileUploadVO_file")
     file_input.send_keys(os.path.abspath(caminho_arquivo))
     log(f"  📄 Arquivo: {os.path.basename(caminho_arquivo)}")
 
-    btn = wait.until(EC.element_to_be_clickable((By.ID, "btConfirmar")))
+    btn = _encontrar_em_frame_conteudo(driver, wait, By.ID, "btConfirmar")
     btn.click()
     log("  ⏳ Processando...")
 

@@ -7,6 +7,7 @@ voxis/
 
 # Arquivo de configuração com credenciais e dados do sistema
 voxis_config.json
+test_navegacao.py
 
 # Build do PyInstaller (caso empacote o bot futuramente)
 autovoxis.spec
