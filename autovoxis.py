@@ -901,8 +901,48 @@ class AutoVoxisUI:
             return
         threading.Thread(target=executar_formatacao, daemon=True).start()
 
+    def _apagar_conteudo_dir(self, pasta: str) -> tuple:
+        """
+        Apaga todos os arquivos dentro da pasta (mantem a pasta em si).
+        Retorna (qtd_apagados, lista_erros).
+        """
+        apagados = 0
+        erros = []
+        if not pasta or not os.path.isdir(pasta):
+            return 0, []
+
+        for root, dirs, files in os.walk(pasta, topdown=False):
+            for nome in files:
+                caminho = os.path.join(root, nome)
+                try:
+                    os.remove(caminho)
+                    apagados += 1
+                except Exception as ex:
+                    erros.append(f"{caminho}: {ex}")
+            for nome in dirs:
+                caminho = os.path.join(root, nome)
+                try:
+                    os.rmdir(caminho)
+                except Exception:
+                    pass
+        return apagados, erros
+
     def _limpar(self):
         global arquivos_selecionados
+        global pasta_saida
+
+        msg = (
+            "Isso vai apagar TODOS os arquivos em:\n"
+            f"- Entrada: {DIR_ENTRADA}\n"
+            f"- Saida:   {pasta_saida}\n\n"
+            "Deseja continuar?"
+        )
+        if not messagebox.askyesno("Confirmar limpeza", msg):
+            return
+
+        apag_entrada, err_entrada = self._apagar_conteudo_dir(DIR_ENTRADA)
+        apag_saida, err_saida = self._apagar_conteudo_dir(pasta_saida)
+
         arquivos_selecionados = []
         self.lbl_arq.config(text="0 selecionado(s)")
         self.lbl_arquivo.config(text="—")
@@ -912,7 +952,15 @@ class AutoVoxisUI:
             self._btn_passo[pid].config(state="disabled", fg=self.C["dim"])
         self.btn_auto.config(state="disabled")
         self._limpar_log()
-        log("🗑  Limpo.")
+        log(f"🗑  Limpo. Entrada: {apag_entrada} arquivo(s). Saida: {apag_saida} arquivo(s).")
+
+        erros = err_entrada + err_saida
+        if erros:
+            log("⚠️  Alguns arquivos nao puderam ser apagados.")
+            for e in erros[:10]:
+                log(f"   • {e}")
+            if len(erros) > 10:
+                log(f"   • ... +{len(erros) - 10} erro(s)")
 
     def _limpar_log(self):
         self.txt.config(state="normal")
