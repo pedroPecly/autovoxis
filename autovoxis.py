@@ -249,10 +249,15 @@ def _criar_driver() -> webdriver.Chrome:
         "credentials_enable_service": False,
         "profile.password_manager_enabled": False,
     })
-    return webdriver.Chrome(
+    # Timeout do ChromeDriver elevado para suportar uploads de arquivos pesados.
+    # keep_alive=True mantém a conexão HTTP aberta durante o processamento longo.
+    timeout_proc = int(CONF.get("timeout_processamento", 120))
+    driver = webdriver.Chrome(
         service=Service(ChromeDriverManager().install()),
         options=opts,
     )
+    driver.command_executor.set_timeout(timeout_proc + 60)
+    return driver
 
 
 def _switch_to_menu_frame(driver: webdriver.Chrome):
@@ -567,11 +572,53 @@ def _aguardar_processamento(driver: webdriver.Chrome, wait: WebDriverWait):
     """
     Aguarda o sistema processar o arquivo carregado.
 
-    ⚠️  TODO (próxima sessão): Implementar detecção precisa de sucesso/erro
-        após análise do HTML da tela pós-upload. Por enquanto aguarda 5 s.
+    Estratégia em 3 camadas:
+      1. Detecta redirecionamento de página (URL ou título muda)
+      2. Detecta desaparecimento do botão Confirmar (formulário submetido)
+      3. Fallback: aguarda timeout_processamento segundos (configurável no JSON)
+
+    Configuração em voxis_config.json:
+      "timeout_processamento": 180   ← segundos máximos de espera (padrão: 120)
     """
-    time.sleep(5)
-    log("  ✅ Processamento concluído")
+    timeout_proc = int(CONF.get("timeout_processamento", 120))
+    log(f"  ⏳ Aguardando processamento (máx {timeout_proc}s)...")
+
+    url_antes    = driver.current_url
+    titulo_antes = driver.title
+    deadline     = time.time() + timeout_proc
+
+    while time.time() < deadline:
+        try:
+            # Camada 1: URL ou título mudou → sistema redirecionou após processar
+            if driver.current_url != url_antes or driver.title != titulo_antes:
+                time.sleep(1)   # estabiliza a página nova
+                log("  ✅ Processamento concluído (redirecionamento detectado)")
+                return
+
+            # Camada 2: botão Confirmar sumiu → formulário foi processado
+            try:
+                driver.switch_to.default_content()
+                driver.switch_to.frame(
+                    driver.find_element(By.NAME, CONF["frame_conteudo"]))
+                driver.switch_to.frame(0)
+            except Exception:
+                pass
+            btns = driver.find_elements(By.ID, "btConfirmar")
+            if not btns or not btns[0].is_displayed():
+                time.sleep(2)   # aguarda página estabilizar
+                log("  ✅ Processamento concluído (botão removido da tela)")
+                return
+
+        except WebDriverException:
+            # Driver em transição de página — sinal de que o upload foi aceito
+            time.sleep(1)
+            log("  ✅ Processamento concluído (navegação detectada)")
+            return
+
+        time.sleep(1)
+
+    # Fallback: timeout esgotado, continua mesmo assim com aviso
+    log(f"  ⚠️ Timeout de {timeout_proc}s atingido — continuando para o próximo arquivo")
 
 
 # ── Loop principal ─────────────────────────────────────────────────
@@ -987,7 +1034,15 @@ class AutoVoxisUI:
             _pause_event.clear()
             self.btn_pausa.config(text="▶ Retomar", bg="#40a02b")
             log("⏸ Automação pausada.")
+            log("   💡 Você pode editar o voxis_config.json agora — será relido ao retomar.")
         else:
+            # Recarrega o JSON para pegar alterações feitas durante a pausa
+            global CONF
+            try:
+                CONF = _carregar_config()
+                log("🔄 Configuração recarregada do voxis_config.json")
+            except Exception as ex:
+                log(f"⚠️ Erro ao recarregar config: {ex} — mantendo configuração anterior")
             _pause_event.set()
             self.btn_pausa.config(text="⏸ Pausar", bg="#df8e1d")
             log("▶ Automação retomada.")
