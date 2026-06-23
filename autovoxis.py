@@ -8,6 +8,7 @@ Autor: Pedro Henrique
 """
 
 import os
+import re
 import json
 import time
 import threading
@@ -65,6 +66,9 @@ PASSOS: list = []   # preenchido após carregar config
 # ══════════════════════════════════════════════════════════════════
 # CONFIGURAÇÃO  (voxis_config.json — ignorado pelo git)
 # ══════════════════════════════════════════════════════════════════
+def _natural_sort_key(s):
+    """Ordenação natural (ex: 1, 2, 10) no lugar de alfabética (1, 10, 2)"""
+    return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', s)]
 
 # Chaves obrigatórias — valores vivem exclusivamente no voxis_config.json
 _CHAVES_CONFIG = (
@@ -120,6 +124,7 @@ _stop_flag     = False
 _pause_event   = threading.Event()
 _pause_event.set()   # inicia "rodando"
 _automation_on = False
+ponto_retomada = None
 
 
 # ══════════════════════════════════════════════════════════════════
@@ -194,6 +199,83 @@ def formatar_csv(caminho_entrada: str, caminho_saida: str,
     return seq - 1
 
 
+def formatar_csv_matr(caminho_entrada: str, pasta_saida_base: str) -> int:
+    """
+    Transforma o CSV original no formato MATR e divide em até 8 arquivos.
+    """
+    with open(caminho_entrada, "r", encoding="latin-1", newline="") as f:
+        linhas = f.read().splitlines()
+
+    if not linhas:
+        raise ValueError("Arquivo vazio")
+
+    colunas = linhas[0].split(";")
+    if len(colunas) > 0:
+        colunas = colunas[1:]  # remove primeira coluna
+
+    idx_num = 1
+    idx_cod_operadora = 2
+    idx_tipo = 4
+    idx_codigo = 6
+    idx_dt_inicio = 8
+    idx_dt_fim = 9
+    idx_class = 11
+
+    linhas_formatadas = []
+
+    for linha in linhas[1:]:
+        linha = linha.strip()
+        if not linha:
+            continue
+            
+        cols = linha.split(";")
+        if len(cols) > 0:
+            cols = cols[1:] # Remove primeira coluna
+        
+        while len(cols) < 30:
+            cols.append("")
+            
+        cols[idx_cod_operadora] = cols[idx_cod_operadora].zfill(3)
+        cols[idx_codigo] = cols[idx_codigo].zfill(8)
+        cols[idx_dt_inicio] = cols[idx_dt_inicio].zfill(8)
+        cols[idx_dt_fim] = cols[idx_dt_fim].zfill(8)
+        
+        linhas_formatadas.append(cols)
+
+    os.makedirs(pasta_saida_base, exist_ok=True)
+    nome_arq_base = os.path.splitext(os.path.basename(caminho_entrada))[0].replace("_original", "")
+    linhas_totais = 0
+    
+    idx_pasta = 1
+    for tipo in ('HP', 'SADT'):
+        for classe in ('GERAL', 'LOCAL', 'FEDERATIVO', 'NACIONAL'):
+            # Inicializa sem a linha do cabeçalho
+            saida_final = []
+            seq = 1
+            
+            for cols in linhas_formatadas:
+                cols_copia = list(cols)
+                cols_copia[idx_num] = str(seq)
+                cols_copia[idx_tipo] = tipo
+                # "GERAL" deve ser representado como em branco
+                cols_copia[idx_class] = "" if classe == "GERAL" else classe
+                
+                saida_final.append(";".join(cols_copia))
+                seq += 1
+                
+            subpasta = f"{idx_pasta:02d}_matr_{tipo.lower()}_{classe.lower()}"
+            pasta_completa = os.path.join(pasta_saida_base, subpasta)
+            os.makedirs(pasta_completa, exist_ok=True)
+            
+            dest = os.path.join(pasta_completa, f"{nome_arq_base}_MATR_{tipo}_{classe}.csv")
+            with open(dest, "w", encoding="latin-1", newline="") as f:
+                f.write("\n".join(saida_final))
+            linhas_totais += (seq - 1)
+            idx_pasta += 1
+
+    return linhas_totais
+
+
 def executar_formatacao():
     """Roda em thread separada. Formata todos os CSVs nas 4 variantes."""
     if not arquivos_selecionados:
@@ -214,7 +296,7 @@ def executar_formatacao():
         os.makedirs(pasta_passo, exist_ok=True)
         log(f"\n📁 {passo['label']}")
 
-        for arq in sorted(arquivos_selecionados):
+        for arq in sorted(arquivos_selecionados, key=_natural_sort_key):
             nome = os.path.splitext(os.path.basename(arq))[0].replace("_original", "")
             dest = os.path.join(
                 pasta_passo,
@@ -229,6 +311,38 @@ def executar_formatacao():
 
     log("\n" + "═" * 48)
     log(f"✅ Formatação concluída!  {total_ok} gerado(s)."
+        + (f"  ⚠️ {total_err} erro(s)." if total_err else ""))
+
+    ui.root.after(0, ui.liberar_botoes_fase1)
+    ui.root.after(0, ui.habilitar_automacao)
+
+
+def executar_formatacao_matr():
+    """Roda em thread separada. Formata CSVs usando lógica MATR."""
+    if not arquivos_selecionados:
+        log("❌ Nenhum arquivo selecionado!")
+        return
+    if not pasta_saida:
+        log("❌ Pasta de saída não definida!")
+        return
+
+    ui.root.after(0, ui.bloquear_botoes_fase1)
+
+    total_ok = total_err = 0
+    log("═" * 48)
+    log(f"🚀 Formatando {len(arquivos_selecionados)} arquivo(s) em MATR (8 subpastas por arquivo)...")
+
+    for arq in sorted(arquivos_selecionados, key=_natural_sort_key):
+        try:
+            qtd = formatar_csv_matr(arq, pasta_saida)
+            log(f"  ✅ {os.path.basename(arq)}  →  {qtd} linhas totais (dividido)")
+            total_ok += 1
+        except Exception as ex:
+            log(f"  ❌ {os.path.basename(arq)}: {ex}")
+            total_err += 1
+
+    log("\n" + "═" * 48)
+    log(f"✅ Formatação MATR concluída!  {total_ok} processado(s)."
         + (f"  ⚠️ {total_err} erro(s)." if total_err else ""))
 
     ui.root.after(0, ui.liberar_botoes_fase1)
@@ -496,13 +610,11 @@ def _navegar_para_upload(driver: webdriver.Chrome, wait: WebDriverWait):
     log("📂 Formulário de upload carregado")
 
 
-def _selecionar_cmat(driver: webdriver.Chrome, wait: WebDriverWait):
+def _selecionar_servico(driver: webdriver.Chrome, wait: WebDriverWait, servico: str):
     """
-    Seleciona o serviço configurado (padrão: CMAT) via JS direto e aciona
+    Seleciona o serviço configurado via JS direto e aciona
     o formulário de upload usando submeter() + mostrarDivs(true).
     """
-    servico = CONF["servico"]
-
     # Garante que o driver está em frameConteudoExterno (nível 1 de aninhamento)
     _encontrar_em_frame_conteudo(driver, wait, By.ID, "filtroServiceId")
 
@@ -622,21 +734,24 @@ def _aguardar_processamento(driver: webdriver.Chrome, wait: WebDriverWait):
 
 
 # ── Loop principal ─────────────────────────────────────────────────
-def executar_automacao():
-    """Roda em thread separada. Percorre os 4 passos × N arquivos."""
-    global _driver, _automation_on, _stop_flag
+def executar_automacao(modo="NORMAL"):
+    """Roda em thread separada. Percorre os passos × N arquivos."""
+    global _driver, _automation_on, _stop_flag, ponto_retomada
 
     _automation_on = True
     _stop_flag     = False
     _pause_event.set()
 
     total_ok = total_err = 0
+    pular_ate_encontrar = bool(ponto_retomada)
 
     try:
         _driver = _criar_driver()
         wait    = WebDriverWait(_driver, int(CONF.get("timeout_aguarde", 40)))
 
         _fazer_login(_driver, wait)
+        
+        modo_servico = "MATR" if modo == "MATR" else CONF["servico"]
 
         for passo in PASSOS:
             if _stop_flag:
@@ -651,7 +766,7 @@ def executar_automacao():
                 os.path.join(pasta_passo, f)
                 for f in os.listdir(pasta_passo)
                 if f.lower().endswith(".csv")
-            ])
+            ], key=_natural_sort_key)
 
             if not arquivos_passo:
                 log(f"⚠️  Nenhum CSV em {passo['pasta']} — pulando")
@@ -670,13 +785,23 @@ def executar_automacao():
                     break
 
                 nome = os.path.basename(arq)
+                
+                # Lógica de Retomada
+                if pular_ate_encontrar:
+                    if passo["id"] == ponto_retomada[0] and nome == ponto_retomada[1]:
+                        pular_ate_encontrar = False
+                        ponto_retomada = None  # Limpa global
+                    else:
+                        log(f"  ⏭ Pulando: {nome}")
+                        continue
+                        
                 log(f"\n  [{idx}/{len(arquivos_passo)}] {nome}")
                 ui.root.after(0, lambda n=nome, i=idx, t=len(arquivos_passo):
                               ui.status(arquivo=n, progresso=f"{i}/{t}"))
 
                 try:
                     _navegar_para_upload(_driver, wait)
-                    _selecionar_cmat(_driver, wait)
+                    _selecionar_servico(_driver, wait, modo_servico)
                     _fazer_upload(_driver, wait, arq)
                     _aguardar_processamento(_driver, wait)
                     log(f"  ✅ OK")
@@ -791,34 +916,26 @@ class AutoVoxisUI:
         self.lbl_prog    = self._row(card, "PROGRESSO", "—")
 
         # ── Card de passos ───────────────────────────────────────
-        pcard = tk.Frame(self._corpo, bg=C["card"], padx=10, pady=8)
-        pcard.pack(fill="x", padx=8, pady=(6, 0))
-        tk.Label(pcard, text="PASSOS DE CARGA NO VOXIS", fg=C["dim"],
+        self.pcard = tk.Frame(self._corpo, bg=C["card"], padx=10, pady=8)
+        self.pcard.pack(fill="x", padx=8, pady=(6, 0))
+        tk.Label(self.pcard, text="PASSOS DE CARGA NO VOXIS", fg=C["dim"],
                  bg=C["card"], font=("Segoe UI", 7, "bold")).pack(
                      anchor="w", pady=(0, 4))
 
-        for p in PASSOS:
-            frame = tk.Frame(pcard, bg=C["card2"], padx=6, pady=4)
-            frame.pack(fill="x", pady=2)
-            lbl_ind = tk.Label(frame, text="○", fg=C["dim"], bg=C["card2"],
-                               font=("Segoe UI", 9, "bold"), width=2)
-            lbl_ind.pack(side="left")
-            self._lbl_passo[p["id"]] = lbl_ind
-            tk.Label(frame, text=p["label"], fg=C["dim"], bg=C["card2"],
-                     font=("Segoe UI", 8), anchor="w").pack(
-                         side="left", fill="x", expand=True, padx=(4, 0))
-            btn = tk.Button(
-                frame, text="📂", fg=C["dim"], bg=C["card2"], bd=0, padx=4,
-                font=("Segoe UI", 9), cursor="hand2",
-                activebackground=C["card2"], activeforeground=C["azul"],
-                state="disabled",
-                command=lambda pid=p["id"]: self._abrir_pasta_passo(pid))
-            btn.pack(side="right")
-            self._btn_passo[p["id"]] = btn
+        self.passos_container = tk.Frame(self.pcard, bg=C["card"])
+        self.passos_container.pack(fill="x")
+        self._build_passos_ui("NORMAL")
 
         # ── Fase 1 — Formatação ──────────────────────────────────
         tk.Frame(self._corpo, bg=C["dim"], height=1).pack(
             fill="x", padx=8, pady=(8, 0))
+            
+        self.modo_fluxo = tk.StringVar(value="NORMAL")
+        fr_modos = tk.Frame(self._corpo, bg=C["bg"])
+        fr_modos.pack(fill="x", padx=12, pady=(3, 0))
+        tk.Radiobutton(fr_modos, text="Fluxo Padrão (CMAT)", variable=self.modo_fluxo, value="NORMAL", bg=C["bg"], fg=C["texto"], selectcolor=C["card"], activebackground=C["bg"], activeforeground=C["azul"], command=self._on_modo_change).pack(side="left")
+        tk.Radiobutton(fr_modos, text="Fluxo MATR", variable=self.modo_fluxo, value="MATR", bg=C["bg"], fg=C["texto"], selectcolor=C["card"], activebackground=C["bg"], activeforeground=C["azul"], command=self._on_modo_change).pack(side="left", padx=10)
+
         tk.Label(self._corpo, text="FASE 1 · FORMATAÇÃO", fg=C["dim"],
                  bg=C["bg"], font=("Segoe UI", 7, "bold")).pack(
                      anchor="w", padx=12, pady=(3, 0))
@@ -839,6 +956,8 @@ class AutoVoxisUI:
         self.bf2.pack(fill="x", padx=8, pady=(2, 4))
         self.btn_auto  = self._btn(self.bf2, "▶ Iniciar Automação", "#1e66f5",
                                    self._iniciar_automacao, state="disabled")
+        self.btn_retomar = self._btn(self.bf2, "▶ Retomar De...", "#8839ef",
+                                     self._abrir_janela_retomar)
         self.btn_pausa = self._btn(self.bf2, "⏸ Pausar", "#df8e1d",
                                    self._toggle_pausa, state="disabled")
         self.btn_parar = self._btn(self.bf2, "🛑 Parar",  "#d20f39",
@@ -866,6 +985,55 @@ class AutoVoxisUI:
         self.txt.tag_configure("info",  foreground=C["ciano"])
         self.txt.tag_configure("dim",   foreground=C["dim"])
         self.txt.tag_configure("hora",  foreground=C["dim"])
+
+    def _build_passos_ui(self, modo):
+        global PASSOS
+        for widget in self.passos_container.winfo_children():
+            widget.destroy()
+        
+        self._lbl_passo.clear()
+        self._btn_passo.clear()
+
+        if modo == "MATR":
+            PASSOS = []
+            idx = 1
+            for tipo in ('HP', 'SADT'):
+                for classe in ('GERAL', 'LOCAL', 'FEDERATIVO', 'NACIONAL'):
+                    pasta = f"{idx:02d}_matr_{tipo.lower()}_{classe.lower()}"
+                    PASSOS.append({
+                        "id": idx,
+                        "transacao": "MATR",
+                        "tab_preco": "MATR",
+                        "pasta": pasta,
+                        "label": f"{idx} · UPLOAD MATR {tipo} {classe}",
+                    })
+                    idx += 1
+        else:
+            PASSOS = _gerar_passos(CONF.get("tabelas_preco", []))
+
+        C = self.C
+        for p in PASSOS:
+            frame = tk.Frame(self.passos_container, bg=C["card2"], padx=6, pady=4)
+            frame.pack(fill="x", pady=2)
+            lbl_ind = tk.Label(frame, text="○", fg=C["dim"], bg=C["card2"],
+                               font=("Segoe UI", 9, "bold"), width=2)
+            lbl_ind.pack(side="left")
+            self._lbl_passo[p["id"]] = lbl_ind
+            tk.Label(frame, text=p["label"], fg=C["dim"], bg=C["card2"],
+                     font=("Segoe UI", 8), anchor="w").pack(
+                         side="left", fill="x", expand=True, padx=(4, 0))
+            btn = tk.Button(
+                frame, text="📂", fg=C["dim"], bg=C["card2"], bd=0, padx=4,
+                font=("Segoe UI", 9), cursor="hand2",
+                activebackground=C["card2"], activeforeground=C["azul"],
+                state="disabled",
+                command=lambda pid=p["id"]: self._abrir_pasta_passo(pid))
+            btn.pack(side="right")
+            self._btn_passo[p["id"]] = btn
+
+    def _on_modo_change(self):
+        modo = self.modo_fluxo.get()
+        self._build_passos_ui(modo)
 
     # ────────────────────────────── HELPERS
     def _row(self, parent, label, valor="—"):
@@ -946,7 +1114,11 @@ class AutoVoxisUI:
         if not arquivos_selecionados:
             messagebox.showerror("Erro", "Selecione os CSVs originais primeiro.")
             return
-        threading.Thread(target=executar_formatacao, daemon=True).start()
+        modo = self.modo_fluxo.get()
+        if modo == "MATR":
+            threading.Thread(target=executar_formatacao_matr, daemon=True).start()
+        else:
+            threading.Thread(target=executar_formatacao, daemon=True).start()
 
     def _apagar_conteudo_dir(self, pasta: str) -> tuple:
         """
@@ -1022,11 +1194,13 @@ class AutoVoxisUI:
                 f"Preencha usuário e senha em:\n{ARQUIVO_CONF}")
             return
         self.btn_auto.config(state="disabled")
+        self.btn_retomar.config(state="disabled")
         self.btn_pausa.config(state="normal")
         self.btn_parar.config(state="normal")
         for b in (self.btn_arqs, self.btn_pasta, self.btn_fmt, self.btn_limpa):
             b.config(state="disabled")
-        threading.Thread(target=executar_automacao, daemon=True).start()
+        modo = self.modo_fluxo.get()
+        threading.Thread(target=executar_automacao, args=(modo,), daemon=True).start()
 
     def _toggle_pausa(self):
         C = self.C
@@ -1064,6 +1238,75 @@ class AutoVoxisUI:
         else:
             messagebox.showwarning("Aviso", f"Pasta não encontrada:\n{caminho}")
 
+    def _abrir_janela_retomar(self):
+        itens = []
+        for p in PASSOS:
+            caminho_passo = os.path.join(pasta_saida, p["pasta"])
+            if os.path.isdir(caminho_passo):
+                arquivos = sorted([
+                    f for f in os.listdir(caminho_passo)
+                    if f.lower().endswith(".csv")
+                ], key=_natural_sort_key)
+                for a in arquivos:
+                    itens.append({
+                        "passo_id": p["id"],
+                        "arquivo": a,
+                        "display": f"[{p['id']:02d}] {a}"
+                    })
+                    
+        if not itens:
+            messagebox.showinfo("Aviso", "Nenhum arquivo encontrado na pasta de saída.")
+            return
+
+        top = tk.Toplevel(self.root)
+        top.title("Retomar")
+        top.geometry("450x500")
+        x = self.root.winfo_x()
+        y = self.root.winfo_y()
+        top.geometry(f"+{x - 15}+{y - 50}")
+        top.attributes("-topmost", True)
+        top.configure(bg=self.C["bg"])
+        
+        tk.Label(top, text="Selecione de onde a automação deve continuar:",
+                 bg=self.C["bg"], fg=self.C["texto"], font=("Segoe UI", 10, "bold")).pack(pady=(15, 5))
+                 
+        frame_list = tk.Frame(top, bg=self.C["bg"])
+        frame_list.pack(fill="both", expand=True, padx=15, pady=5)
+
+        lb = tk.Listbox(frame_list, bg=self.C["card"], fg=self.C["texto"],
+                        selectbackground=self.C["azul"], selectforeground="white",
+                        font=("Segoe UI", 9), highlightthickness=0, bd=0)
+        sb = tk.Scrollbar(frame_list, command=lb.yview, bg=self.C["card"], width=12)
+        lb.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        lb.pack(side="left", fill="both", expand=True)
+        
+        for item in itens:
+            lb.insert("end", "  " + item["display"])
+            
+        def confirmar():
+            sel = lb.curselection()
+            if not sel:
+                messagebox.showwarning("Aviso", "Selecione um arquivo primeiro.")
+                return
+            escolha = itens[sel[0]]
+            global ponto_retomada
+            ponto_retomada = (escolha["passo_id"], escolha["arquivo"])
+            top.destroy()
+            log(f"🚀 Retomada a partir de: {escolha['arquivo']}")
+            self._iniciar_automacao()
+            
+        btn_frame = tk.Frame(top, bg=self.C["bg"])
+        btn_frame.pack(fill="x", pady=15, padx=15)
+        
+        tk.Button(btn_frame, text="Cancelar", bg=self.C["dim"], fg="white", bd=0,
+                  font=("Segoe UI", 9, "bold"), cursor="hand2", command=top.destroy,
+                  padx=15, pady=6).pack(side="left", expand=True, fill="x", padx=2)
+                  
+        tk.Button(btn_frame, text="Confirmar e Iniciar", bg=self.C["verde"], fg="white", bd=0,
+                  font=("Segoe UI", 9, "bold"), cursor="hand2", command=confirmar,
+                  padx=15, pady=6).pack(side="left", expand=True, fill="x", padx=2)
+
     # ────────────────────────────── ESTADOS DOS PASSOS (chamados da thread)
     def marcar_passo_ativo(self, passo_id: int):
         self._lbl_passo[passo_id].config(text="►", fg=self.C["amarelo"])
@@ -1076,6 +1319,7 @@ class AutoVoxisUI:
     def habilitar_automacao(self):
         """Chamado ao fim da formatação."""
         self.btn_auto.config(state="normal")
+        self.btn_retomar.config(state="normal")
         for pid in self._btn_passo:
             self._btn_passo[pid].config(state="normal", fg=self.C["ciano"])
 
@@ -1085,6 +1329,7 @@ class AutoVoxisUI:
         self.btn_pausa.config(state="disabled", text="⏸ Pausar", bg="#df8e1d")
         self.btn_parar.config(state="disabled")
         self.btn_auto.config(state="normal")
+        self.btn_retomar.config(state="normal")
         for b in (self.btn_arqs, self.btn_pasta, self.btn_fmt, self.btn_limpa):
             b.config(state="normal")
 
